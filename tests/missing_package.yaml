@@ -1,0 +1,5 @@
+repository_url: https://alpinelinux.org
+repo_mode: online
+package_version: 8.2.1-r0
+output_image_path: output/graph.png
+ascii_tree_output: true
