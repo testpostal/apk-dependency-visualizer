@@ -2,73 +2,179 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public class Main {
-    private static final String[] REQUIRED_KEYS = {
-            "package_name", "repository_url", "repo_mode",
-            "package_version", "output_image_path", "ascii_tree_output"
-    };
+    private static final String DEFAULT_CONFIG_PATH = "config.yaml";
+    private static final int NOT_FOUND = -1;
+    private static final int FIRST_ARG_INDEX = 0;
+    private static final int START_INDEX = 0;
+    private static final int QUOTE_OFFSET = 1;
+    private static final int EXIT_FAILURE = 1;
+    private static final int MIN_QUOTED_LENGTH = 2;
+
+    private static final List<String> REQUIRED_KEYS = List.of(
+            "package_name",
+            "repository_url",
+            "repo_mode",
+            "package_version",
+            "output_image_path",
+            "ascii_tree_output"
+    );
 
     public static void main(String[] args) {
-        String configPath = "config.yaml";
+        String configPath = args.length > FIRST_ARG_INDEX ? args[FIRST_ARG_INDEX] : DEFAULT_CONFIG_PATH;
         File configFile = new File(configPath);
 
-        if (!configFile.exists()) {
-            System.err.println("Ошибка: Конфигурационный файл '" + configPath + "' не найден.");
-            System.exit(1);
+        if (!configFile.exists() || !configFile.isFile()) {
+            exitWithError("Конфигурационный файл '" + configPath + "' не найден.");
         }
 
         Map<String, String> config = parseYaml(configFile);
         validateConfig(config);
-        printConfig(config);
+        runStageTwo(config);
     }
 
     private static Map<String, String> parseYaml(File file) {
         Map<String, String> config = new HashMap<>();
-        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(file, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty() || line.startsWith("#")) continue;
-
-                int colonIndex = line.indexOf(":");
-                if (colonIndex != -1) {
-                    String key = line.substring(0, colonIndex).trim();
-                    String value = line.substring(colonIndex + 1).trim();
-                    value = stripQuotes(value);
-                    if (!value.isEmpty()) config.put(key, value);
-                }
+                parseLine(line.trim(), config);
             }
         } catch (IOException e) {
-            System.err.println("Ошибка при чтении файла: " + e.getMessage());
-            System.exit(1);
+            exitWithError("Ошибка при чтении файла: " + e.getMessage());
         }
         return config;
     }
 
+    private static void parseLine(String line, Map<String, String> config) {
+        if (line.isEmpty() || line.startsWith("#")) {
+            return;
+        }
+        int colonIndex = line.indexOf(":");
+        if (colonIndex == NOT_FOUND) {
+            exitWithError("Некорректный формат строки YAML: '" + line + "'.");
+        }
+        String key = line.substring(START_INDEX, colonIndex).trim();
+        if (!REQUIRED_KEYS.contains(key)) {
+            exitWithError("Неизвестный параметр конфигурации: '" + key + "'.");
+        }
+        String rawValue = stripInlineComment(line.substring(colonIndex + QUOTE_OFFSET)).trim();
+        config.put(key, stripQuotes(rawValue));
+    }
+
+    private static String stripInlineComment(String value) {
+        boolean inQuotes = false;
+        for (int i = START_INDEX; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (current == '"' || current == '\'') {
+                inQuotes = !inQuotes;
+            } else if (current == '#' && !inQuotes) {
+                return value.substring(START_INDEX, i);
+            }
+        }
+        return value;
+    }
+
     private static String stripQuotes(String value) {
-        if ((value.startsWith("\"") && value.endsWith("\"")) ||
-                (value.startsWith("'") && value.endsWith("'"))) {
-            return value.substring(1, value.length() - 1);
+        boolean hasDoubleQuotes = value.startsWith("\"") && value.endsWith("\"");
+        boolean hasSingleQuotes = value.startsWith("'") && value.endsWith("'");
+        if (value.length() >= MIN_QUOTED_LENGTH && (hasDoubleQuotes || hasSingleQuotes)) {
+            return value.substring(QUOTE_OFFSET, value.length() - QUOTE_OFFSET);
         }
         return value;
     }
 
     private static void validateConfig(Map<String, String> config) {
         for (String key : REQUIRED_KEYS) {
-            if (!config.containsKey(key)) {
-                System.err.println("Ошибка конфигурации: отсутствует параметр '" + key + "'.");
-                System.exit(1);
+            String value = config.get(key);
+            if (value == null || value.isEmpty()) {
+                exitWithError("Отсутствует или пуст обязательный параметр '" + key + "'.");
             }
+        }
+        validateNoSpaces(config.get("package_name"), "package_name");
+        validateNoSpaces(config.get("package_version"), "package_version");
+        validateBoolean(config.get("repo_mode"), "repo_mode");
+        validateBoolean(config.get("ascii_tree_output"), "ascii_tree_output");
+        validateRepository(config.get("repository_url"), Boolean.parseBoolean(config.get("repo_mode")));
+        validateOutputImage(config.get("output_image_path"));
+    }
+
+    private static void validateNoSpaces(String value, String paramName) {
+        if (value.contains(" ") || value.contains("\t")) {
+            exitWithError("Параметр '" + paramName + "' не должен содержать пробелы.");
         }
     }
 
-    private static void printConfig(Map<String, String> config) {
-        System.out.println("===Параметры конфигурации===");
-        for (String key : REQUIRED_KEYS) {
-            System.out.println(key + ": " + config.get(key));
+    private static void validateBoolean(String value, String paramName) {
+        if (!"true".equalsIgnoreCase(value) && !"false".equalsIgnoreCase(value)) {
+            exitWithError("Параметр '" + paramName + "' должен быть true или false.");
         }
+    }
+
+    private static void validateRepository(String repoLocation, boolean isTestMode) {
+        if (isTestMode) {
+            File testRepo = new File(repoLocation);
+            if (!testRepo.exists() || !testRepo.isFile()) {
+                exitWithError("Файл тестового репозитория не найден: '" + repoLocation + "'.");
+            }
+            return;
+        }
+        try {
+            URI uri = URI.create(repoLocation);
+            if (uri.getScheme() == null || uri.getHost() == null) {
+                exitWithError("Некорректный URL репозитория: '" + repoLocation + "'.");
+            }
+        } catch (IllegalArgumentException e) {
+            exitWithError("Некорректный URL репозитория: '" + repoLocation + "'.");
+        }
+    }
+
+    private static void validateOutputImage(String imagePath) {
+        if (!imagePath.toLowerCase().endsWith(".png")) {
+            exitWithError("Выходной файл должен иметь расширение .png: '" + imagePath + "'.");
+        }
+    }
+
+    private static void runStageTwo(Map<String, String> config) {
+        boolean isTestMode = Boolean.parseBoolean(config.get("repo_mode"));
+        if (isTestMode) {
+            exitWithError("Режим тестового репозитория (укажите repo_mode: false).");
+        }
+        ApkIndexLoader loader = new ApkIndexLoader();
+        String repoUrl = config.get("repository_url");
+        String packageName = config.get("package_name");
+        String packageVersion = config.get("package_version");
+
+        try {
+            List<String> dependencies = loader.getDirectDependencies(repoUrl, packageName, packageVersion);
+            printDependencies(packageName, packageVersion, dependencies);
+        } catch (IOException e) {
+            exitWithError("Ошибка при получении данных о зависимостях: " + e.getMessage());
+        }
+    }
+
+    private static void printDependencies(
+            String packageName,
+            String packageVersion,
+            List<String> dependencies) {
+        System.out.println("Прямые зависимости для " + packageName + " (" + packageVersion + "):");
+        if (dependencies.isEmpty()) {
+            System.out.println("Зависимости отсутствуют.");
+            return;
+        }
+        for (String dep : dependencies) {
+            System.out.println("- " + dep);
+        }
+    }
+
+    private static void exitWithError(String message) {
+        System.err.println("Ошибка конфигурации: " + message);
+        System.exit(EXIT_FAILURE);
     }
 }
