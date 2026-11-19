@@ -6,10 +6,12 @@ import java.io.InputStreamReader;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.zip.GZIPInputStream;
 
-public class ApkIndexLoader {
+public class ApkIndexLoader implements DependencyProvider {
     private static final int TAR_BLOCK_SIZE = 512;
     private static final int NAME_OFFSET = 0;
     private static final int NAME_LENGTH = 100;
@@ -20,13 +22,34 @@ public class ApkIndexLoader {
     private static final int PREFIX_LENGTH = 2;
     private static final String TARGET_ENTRY = "APKINDEX";
 
-    public List<String> getDirectDependencies(
+    private final Map<String, List<String>> packageDeps = new HashMap<>();
+    private final Map<String, String> packageVersions = new HashMap<>();
+    private final Map<String, String> virtualProviders = new HashMap<>();
+
+    public void loadRepository(
             String repoUrl,
-            String packageName,
-            String packageVersion) throws IOException {
-        String indexUrl = buildIndexUrl(repoUrl);
-        byte[] indexBytes = downloadAndExtractIndex(indexUrl);
-        return findDependenciesInIndex(indexBytes, packageName, packageVersion);
+            String rootPackage,
+            String rootVersion) throws IOException {
+        byte[] indexBytes = downloadAndExtractIndex(buildIndexUrl(repoUrl));
+        parseIndex(indexBytes);
+        String actualVersion = packageVersions.get(rootPackage);
+        if (actualVersion == null || !actualVersion.equals(rootVersion)) {
+            throw new IOException(
+                    "Пакет '" + rootPackage + "' версии '" + rootVersion + "' не найден.");
+        }
+    }
+
+    @Override
+    public List<String> getDependencies(String packageName) {
+        List<String> rawDeps = packageDeps.getOrDefault(packageName, List.of());
+        List<String> resolved = new ArrayList<>();
+        for (String dep : rawDeps) {
+            String target = virtualProviders.getOrDefault(dep, dep);
+            if (!target.equals(packageName) && !resolved.contains(target)) {
+                resolved.add(target);
+            }
+        }
+        return resolved;
     }
 
     private String buildIndexUrl(String repoUrl) {
@@ -105,63 +128,51 @@ public class ApkIndexLoader {
         stream.skipNBytes(entrySize + padding);
     }
 
-    private List<String> findDependenciesInIndex(
-            byte[] indexBytes,
-            String targetName,
-            String targetVersion) throws IOException {
+    private void parseIndex(byte[] indexBytes) throws IOException {
         BufferedReader reader = new BufferedReader(
                 new InputStreamReader(new ByteArrayInputStream(indexBytes), StandardCharsets.UTF_8));
-        String currentName = "";
-        String currentVersion = "";
-        List<String> currentDeps = new ArrayList<>();
+        Map<String, String> record = new HashMap<>();
         String line;
-
         while ((line = reader.readLine()) != null) {
             if (line.isEmpty()) {
-                if (isTargetPackage(targetName, targetVersion, currentName, currentVersion)) {
-                    return currentDeps;
-                }
-                currentName = "";
-                currentVersion = "";
-                currentDeps = new ArrayList<>();
-            } else if (line.startsWith("P:")) {
-                currentName = line.substring(PREFIX_LENGTH);
-            } else if (line.startsWith("V:")) {
-                currentVersion = line.substring(PREFIX_LENGTH);
-            } else if (line.startsWith("D:")) {
-                currentDeps = parseDependenciesLine(line.substring(PREFIX_LENGTH));
+                saveRecord(record);
+                record.clear();
+            } else if (line.length() >= PREFIX_LENGTH) {
+                record.put(line.substring(ZERO_BYTE, PREFIX_LENGTH), line.substring(PREFIX_LENGTH));
             }
         }
-        if (isTargetPackage(targetName, targetVersion, currentName, currentVersion)) {
-            return currentDeps;
+        saveRecord(record);
+    }
+
+    private void saveRecord(Map<String, String> record) {
+        String name = record.get("P:");
+        String version = record.get("V:");
+        if (name == null || version == null) {
+            return;
         }
-        throw new IOException("Пакет '" + targetName + "' версии '" + targetVersion + "' не найден.");
+        packageVersions.put(name, version);
+        packageDeps.put(name, parseTokens(record.getOrDefault("D:", "")));
+        for (String provided : parseTokens(record.getOrDefault("p:", ""))) {
+            virtualProviders.putIfAbsent(provided, name);
+        }
     }
 
-    private boolean isTargetPackage(
-            String targetName,
-            String targetVersion,
-            String currentName,
-            String currentVersion) {
-        return targetName.equals(currentName) && targetVersion.equals(currentVersion);
-    }
-
-    private List<String> parseDependenciesLine(String rawDeps) {
-        List<String> dependencies = new ArrayList<>();
-        String trimmed = rawDeps.trim();
+    private List<String> parseTokens(String rawLine) {
+        List<String> items = new ArrayList<>();
+        String trimmed = rawLine.trim();
         if (trimmed.isEmpty()) {
-            return dependencies;
+            return items;
         }
-        for (String item : trimmed.split("\\s+")) {
-            String cleaned = cleanDependencyName(item);
+        for (String token : trimmed.split("\\s+")) {
+            String cleaned = cleanTokenName(token);
             if (!cleaned.isEmpty()) {
-                dependencies.add(cleaned);
+                items.add(cleaned);
             }
         }
-        return dependencies;
+        return items;
     }
 
-    private String cleanDependencyName(String token) {
+    private String cleanTokenName(String token) {
         if (token.startsWith("!")) {
             return "";
         }

@@ -27,7 +27,9 @@ public class Main {
     );
 
     public static void main(String[] args) {
-        String configPath = args.length > FIRST_ARG_INDEX ? args[FIRST_ARG_INDEX] : DEFAULT_CONFIG_PATH;
+        String configPath = args.length > FIRST_ARG_INDEX
+                ? args[FIRST_ARG_INDEX]
+                : DEFAULT_CONFIG_PATH;
         File configFile = new File(configPath);
 
         if (!configFile.exists() || !configFile.isFile()) {
@@ -36,12 +38,13 @@ public class Main {
 
         Map<String, String> config = parseYaml(configFile);
         validateConfig(config);
-        runStageTwo(config);
+        runStageThree(config);
     }
 
     private static Map<String, String> parseYaml(File file) {
         Map<String, String> config = new HashMap<>();
-        try (BufferedReader reader = new BufferedReader(new FileReader(file, StandardCharsets.UTF_8))) {
+        try (BufferedReader reader = new BufferedReader(
+                new FileReader(file, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 parseLine(line.trim(), config);
@@ -101,7 +104,10 @@ public class Main {
         validateNoSpaces(config.get("package_version"), "package_version");
         validateBoolean(config.get("repo_mode"), "repo_mode");
         validateBoolean(config.get("ascii_tree_output"), "ascii_tree_output");
-        validateRepository(config.get("repository_url"), Boolean.parseBoolean(config.get("repo_mode")));
+        validateRepository(
+                config.get("repository_url"),
+                Boolean.parseBoolean(config.get("repo_mode"))
+        );
         validateOutputImage(config.get("output_image_path"));
     }
 
@@ -141,40 +147,55 @@ public class Main {
         }
     }
 
-    private static void runStageTwo(Map<String, String> config) {
-        boolean isTestMode = Boolean.parseBoolean(config.get("repo_mode"));
-        if (isTestMode) {
-            exitWithError("Режим тестового репозитория (укажите repo_mode: false).");
-        }
-        ApkIndexLoader loader = new ApkIndexLoader();
-        String repoUrl = config.get("repository_url");
+    private static void runStageThree(Map<String, String> config) {
         String packageName = config.get("package_name");
-        String packageVersion = config.get("package_version");
-
         try {
-            List<String> dependencies = loader.getDirectDependencies(repoUrl, packageName, packageVersion);
-            printDependencies(packageName, packageVersion, dependencies);
+            DependencyProvider provider = createProvider(config);
+            DependencyGraphBuilder builder = new DependencyGraphBuilder();
+            builder.build(packageName, provider);
+            printGraph(packageName, builder);
         } catch (IOException e) {
-            exitWithError("Ошибка при получении данных о зависимостях: " + e.getMessage());
+            exitWithError("Ошибка при построении графа зависимостей: " + e.getMessage());
         }
     }
 
-    private static void printDependencies(
-            String packageName,
-            String packageVersion,
-            List<String> dependencies) {
-        System.out.println("Прямые зависимости для " + packageName + " (" + packageVersion + "):");
-        if (dependencies.isEmpty()) {
-            System.out.println("Зависимости отсутствуют.");
+    private static DependencyProvider createProvider(
+            Map<String, String> config) throws IOException {
+        boolean isTestMode = Boolean.parseBoolean(config.get("repo_mode"));
+        String repoLocation = config.get("repository_url");
+        String packageName = config.get("package_name");
+        if (isTestMode) {
+            return new TestRepoLoader(repoLocation, packageName);
+        }
+        ApkIndexLoader loader = new ApkIndexLoader();
+        loader.loadRepository(repoLocation, packageName, config.get("package_version"));
+        return loader;
+    }
+
+    private static void printGraph(String rootPackage, DependencyGraphBuilder builder) {
+        System.out.println("Граф зависимостей для пакета '" + rootPackage + "':");
+        for (Map.Entry<String, List<String>> entry : builder.getAdjacencyList().entrySet()) {
+            String deps = entry.getValue().isEmpty()
+                    ? "(нет зависимостей)"
+                    : String.join(", ", entry.getValue());
+            System.out.println("  " + entry.getKey() + " -> " + deps);
+        }
+        printCycles(builder.getDetectedCycles());
+    }
+
+    private static void printCycles(List<String> cycles) {
+        if (cycles.isEmpty()) {
+            System.out.println("Циклические зависимости не обнаружены.");
             return;
         }
-        for (String dep : dependencies) {
-            System.out.println("- " + dep);
+        System.out.println("Обнаружены повторные/циклические переходы:");
+        for (String cycle : cycles) {
+            System.out.println("  * " + cycle);
         }
     }
 
     private static void exitWithError(String message) {
-        System.err.println("Ошибка конфигурации: " + message);
+        System.err.println("Ошибка: " + message);
         System.exit(EXIT_FAILURE);
     }
 }
